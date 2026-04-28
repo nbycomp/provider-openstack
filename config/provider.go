@@ -117,6 +117,7 @@ func GetProvider(ctx context.Context, generationProvider bool) (*ujconfig.Provid
 	)
 
 	bumpVersionsWithEmbeddedLists(pc)
+	addCorrelationInitializer(pc)
 	for _, configure := range []func(provider *ujconfig.Provider){
 		// add custom config functions
 		blockstorageCluster.Configure,
@@ -166,6 +167,7 @@ func GetProviderNamespaced(ctx context.Context, generationProvider bool) (*ujcon
 	)
 
 	bumpVersionsWithEmbeddedLists(pc)
+	addCorrelationInitializer(pc)
 	for _, configure := range []func(provider *ujconfig.Provider){
 		// add custom config functions
 		blockstorageNamespaced.Configure,

@@ -134,6 +134,39 @@ spec:
     name: provider-openstack
 ```
 
+## Developing
+
+# GO 1.25.0 ONLY
+
+Run code-generation pipeline:
+```console
+go run cmd/generator/main.go \
+  --generated-resource-list="$PWD/config/generated.lst" \
+  "$PWD"
+```
+
+Run against a Kubernetes cluster:
+
+```console
+make run
+```
+
+Build, push, and install:
+
+```console
+make generate
+make all
+crank xpkg push -f _output/xpkg/linux_amd64/provider-openstackv2-v0.0.0-X.whatever.xpkg registry.nearbycomputing.com/public/provider-openstackv2:v0.0.1
+```
+
+(download crank from https://releases.crossplane.io/stable/current/bin)
+
+Build binary:
+
+```console
+make build
+```
+
 ## Report a Bug
 
 For filing bugs, suggesting improvements, or requesting new features, please

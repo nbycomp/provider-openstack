@@ -42,6 +42,7 @@ import (
 	"github.com/crossplane-contrib/provider-openstack/internal/clients"
 	controllerCluster "github.com/crossplane-contrib/provider-openstack/internal/controller/cluster"
 	controllerNamespaced "github.com/crossplane-contrib/provider-openstack/internal/controller/namespaced"
+	"github.com/crossplane-contrib/provider-openstack/internal/correlationlog"
 	"github.com/crossplane-contrib/provider-openstack/internal/features"
 	"github.com/crossplane-contrib/provider-openstack/internal/version"
 )
@@ -96,7 +97,8 @@ func main() {
 	ctrl.SetLogger(zap.New(zap.WriteTo(io.Discard)))
 
 	zl := zap.New(zap.UseDevMode(*debug))
-	logr := logging.NewLogrLogger(zl.WithName("provider-openstack"))
+	baseLogger := logging.NewLogrLogger(zl.WithName("provider-openstack"))
+	logr := correlationlog.NewCorrelatingLogger(baseLogger)
 	if *debug {
 		// The controller-runtime runs with a no-op logger by default. It is
 		// *very* verbose even at info level, so we only provide it a real

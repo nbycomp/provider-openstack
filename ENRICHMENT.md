@@ -13,257 +13,85 @@ metadata:
     nby.one/correlation_id: '{"deployment_id": "d-1234", "team": "platform"}'
 ```
 
-The value must be a flat JSON object. Keys that would clash with standard
-controller-runtime log fields (`controller`, `controllerKind`, `name`,
-`namespace`, `reconcileID`) are automatically prefixed with `correlation_id_`.
+The value must be a flat JSON object. Keys that would clash with fields the
+reconciler, upjet or controller-runtime already log (`controller`,
+`controllerKind`, `name`, `namespace`, `reconcileID`, `request`, `uid`, `gvk`,
+`trackerUID`, `resourceName`, `resourceNamespace`, `error`, `external-name`,
+`version`), or with the JSON encoder's own keys (`ts`, `level`, `msg`,
+`logger`, `caller`, `stacktrace`), are prefixed with `correlation_id_`. A
+malformed annotation is ignored and reported once per reconcile with
+`faultDomain: input`; it never fails the reconcile.
 
 ## How it works
 
 Two cooperating components are wired together:
 
-1. **`CorrelatingLogger`** — a `logging.Logger` wrapper set as the provider's
-   top-level logger. On every `Info` / `Debug` call it reads a goroutine-local
-   `sync.Map` and prepends any correlation fields stored there. Because
-   `WithValues` propagates the same underlying logger (and the map is
-   package-level), all derived loggers — including the managed reconciler's
-   internal `r.log` set via `managed.WithLogger(o.Logger.WithValues(...))` —
-   go through this wrapper.
+1. **`correlationInitializer`**: a `managed.Initializer` registered as the
+   first initializer on every controller. On each reconcile it parses the
+   annotation and stores the fields in a package-level map keyed by the managed
+   resource, once under its UID and once under its API group, kind, namespace
+   and name. A resource with no annotation, or a malformed one, has its entries
+   removed.
 
-2. **`correlationInitializer`** — a `managed.Initializer` registered as the
-   first initializer on every controller. At the start of each reconcile cycle,
-   after the managed resource has been fetched from the API server, it parses
-   the annotation and writes the fields into the shared goroutine-local map.
-   From that point onwards every log call on the same goroutine carries the
-   fields.
+2. **`CorrelatingLogger`**: a `logging.Logger` wrapper set as the provider's
+   top-level logger. The managed reconciler and upjet already attach the
+   resource's identity through `WithValues`:
+   - the reconciler adds `controller` and `request`, then `uid`
+   - the external client adds `uid`, `name`, `namespace` and `gvk`
+   - the async operation tracker adds `trackerUID`, `resourceName`, `resourceNamespace` and `gvk`
+   - the event handler adds `gvk`, then `name`
 
-Controller-runtime worker goroutines each process one reconcile at a time, so
-keying by goroutine ID is safe: the entry is overwritten at the start of the
-next reconcile for that goroutine, and no cleanup is needed.
+   A bound UID takes precedence: the external client and the tracker take `gvk`
+   from the object's `TypeMeta`, which is empty after an API write such as the
+   reference resolver's patch.
+
+   The wrapper binds to that identity and adds the stored fields of that
+   resource, and only that resource, to every `Info` and `Debug` line.
+   Values passed at call time are only used while the bound values do not yet
+   name a resource, so a line that mentions another object's `name` keeps its
+   own resource.
+
+Because the store is keyed by resource rather than by goroutine, a line never
+carries another resource's fields. Lines logged outside the reconcile
+goroutine, such as the async create, update and delete callbacks, are enriched
+too.
 
 The initializer is registered via upjet's `InitializerFns` mechanism, which is
 already supported by the code-generation template. Adding a non-empty
 `InitializerFns` slice to every resource config causes the generator to emit the
 corresponding loop in every `zz_controller.go`.
 
+## Logging output
+
+`--log-format` selects `json` (default) or `console`. `--debug` sets only the
+level, so the debug lines that carry most of the reconcile detail can be
+shipped as JSON.
+
 ## Known limitations
 
 | Lines | Enriched? | Reason |
 |---|---|---|
-| All post-`Initialize` reconcile lines (Connect, Observe, Create, Update, Delete …) | ✅ | `r.log` goes through `CorrelatingLogger`; fields set by the initializer |
-| Pre-`Initialize` debug lines (`"Reconciling"` etc.) on the **first** reconcile cycle | ⚠️ | `Initialize` has not yet run; all are `Debug` level, suppressed in production. Subsequent cycles see the fields because the goroutine-local entry persists from the previous cycle. |
-| Orphan-deletion path (`DeletionPolicy: Orphan`) | ⚠️ | Skips `Initialize` entirely |
-| Upjet async Terraform worker goroutine | ⚠️ | Spawned by `OperationTrackerStore`; goroutine-local fields do not follow across goroutine boundaries |
-| Event-handler callbacks (`"Calling the inner handler …"`) | ⚠️ | Fired from informer watch goroutines, not the reconcile goroutine |
+| Reconcile, external client and async callback lines | ✅ | Bound to the resource through the identity keys above |
+| Lines logged before the first `Initialize` of a resource | ⚠️ | Nothing is stored yet; they carry no correlation fields |
+| Orphan-deletion path (`DeletionPolicy: Orphan`) and paused resources | ⚠️ | Skip `Initialize`; use the fields stored by an earlier reconcile, if any |
+| Lines logged before the reconciler binds `uid`, for a resource recreated under the same name | ⚠️ | Looked up by kind and name, so they may carry the deleted object's fields |
+
+Entries for deleted resources stay in the map; each holds only the resource's
+correlation fields.
 
 ## Changes required
 
-### 1. New file — `internal/correlationlog/correlationlog.go`
+### 1. New file: `internal/correlationlog/correlationlog.go`
 
-Create the file with the following content. No new external dependencies are
-introduced; all imports are already present in the module.
+The initializer, the store and `CorrelatingLogger`. See the file; its tests in
+`correlationlog_test.go` cover cross-resource isolation, async callbacks,
+malformed annotations and key remapping.
 
-```go
-package correlationlog
+### 2. New file: `config/correlation.go`
 
-import (
-	"context"
-	"encoding/json"
-	"fmt"
-	"runtime"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
-
-	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
-	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
-	xpresource "github.com/crossplane/crossplane-runtime/v2/pkg/resource"
-)
-
-const (
-	// CorrelationAnnotationKey is the annotation used to carry correlation
-	// metadata as a JSON object for structured log enrichment.
-	CorrelationAnnotationKey = "nby.one/correlation_id"
-
-	reservedFieldPrefix = "correlation_id_"
-)
-
-var reservedLogFieldKeys = map[string]struct{}{
-	"controller":     {},
-	"controllerKind": {},
-	"name":           {},
-	"namespace":      {},
-	"reconcileID":    {},
-}
-
-// sharedFields is the single goroutine-local store used by all
-// CorrelatingLogger instances and all correlationInitializer instances in this
-// process. Keyed by goroutine ID (uint64), values are []any kv slices.
-var sharedFields sync.Map
-
-// NewCorrelatingLogger wraps base so that every Info and Debug call
-// automatically prepends the per-goroutine correlation fields written by the
-// correlationInitializer at the start of each reconcile. Wire it around the
-// top-level logger in main.go.
-func NewCorrelatingLogger(base logging.Logger) *CorrelatingLogger {
-	return &CorrelatingLogger{base: base}
-}
-
-// NewInitializer returns a managed.Initializer that, on each reconcile,
-// parses the correlation annotation of the managed resource and stores the
-// fields in the shared goroutine-local store so that every subsequent log call
-// on any CorrelatingLogger picks them up.
-func NewInitializer() managed.Initializer {
-	return &correlationInitializer{}
-}
-
-// CorrelatingLogger wraps a logging.Logger and prepends per-goroutine
-// correlation fields on every Info and Debug call.
-type CorrelatingLogger struct {
-	base logging.Logger
-}
-
-// Info implements logging.Logger.
-func (l *CorrelatingLogger) Info(msg string, kvs ...any) {
-	l.base.Info(msg, enrich(kvs)...)
-}
-
-// Debug implements logging.Logger.
-func (l *CorrelatingLogger) Debug(msg string, kvs ...any) {
-	l.base.Debug(msg, enrich(kvs)...)
-}
-
-// WithValues implements logging.Logger.
-func (l *CorrelatingLogger) WithValues(kvs ...any) logging.Logger {
-	return &CorrelatingLogger{base: l.base.WithValues(kvs...)}
-}
-
-func enrich(kvs []any) []any {
-	v, ok := sharedFields.Load(currentGoroutineID())
-	if !ok {
-		return kvs
-	}
-	corr := v.([]any)
-	out := make([]any, 0, len(corr)+len(kvs))
-	return append(append(out, corr...), kvs...)
-}
-
-// correlationInitializer implements managed.Initializer.
-type correlationInitializer struct{}
-
-func (correlationInitializer) Initialize(_ context.Context, mg xpresource.Managed) error {
-	values, err := extractCorrelationValues(mg.GetAnnotations())
-	if err != nil || len(values) == 0 {
-		return nil
-	}
-	keys := sortedKeys(values)
-	kvs := make([]any, 0, len(keys)*2)
-	for _, k := range keys {
-		kvs = append(kvs, logFieldKey(k), values[k])
-	}
-	sharedFields.Store(currentGoroutineID(), kvs)
-	return nil
-}
-
-// currentGoroutineID returns the ID of the calling goroutine by parsing the
-// first line of a runtime stack trace ("goroutine NNN [...]"). This format
-// has been stable across all Go versions and is widely used in practice.
-func currentGoroutineID() uint64 {
-	var buf [64]byte
-	n := runtime.Stack(buf[:], false)
-	fields := strings.Fields(string(buf[:n]))
-	if len(fields) < 2 {
-		return 0
-	}
-	id, _ := strconv.ParseUint(fields[1], 10, 64)
-	return id
-}
-
-func extractCorrelationValues(annotations map[string]string) (map[string]string, error) {
-	if len(annotations) == 0 {
-		return nil, nil
-	}
-	raw := strings.TrimSpace(annotations[CorrelationAnnotationKey])
-	if raw == "" {
-		return nil, nil
-	}
-	parsed := make(map[string]any)
-	dec := json.NewDecoder(strings.NewReader(raw))
-	dec.UseNumber()
-	if err := dec.Decode(&parsed); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", CorrelationAnnotationKey, err)
-	}
-	values := make(map[string]string, len(parsed))
-	for k, v := range parsed {
-		if strings.TrimSpace(k) == "" {
-			continue
-		}
-		values[k] = stringify(v)
-	}
-	if len(values) == 0 {
-		return nil, nil
-	}
-	return values, nil
-}
-
-func stringify(v any) string {
-	switch t := v.(type) {
-	case string:
-		return t
-	case json.Number:
-		return t.String()
-	default:
-		b, err := json.Marshal(t)
-		if err != nil {
-			return fmt.Sprint(t)
-		}
-		return string(b)
-	}
-}
-
-func logFieldKey(key string) string {
-	if _, reserved := reservedLogFieldKeys[key]; reserved {
-		return reservedFieldPrefix + key
-	}
-	return key
-}
-
-func sortedKeys(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-```
-
-### 2. New file — `config/correlation.go`
-
-```go
-package config
-
-import (
-	"github.com/crossplane-contrib/provider-openstack/internal/correlationlog"
-	ujconfig "github.com/crossplane/upjet/v2/pkg/config"
-	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-)
-
-// addCorrelationInitializer prepends the correlation log enrichment initializer
-// to every managed resource in pc. It is called from GetProvider and
-// GetProviderNamespaced so that the code generator also sees the non-empty
-// InitializerFns and emits the loop in every zz_controller.go.
-func addCorrelationInitializer(pc *ujconfig.Provider) {
-	fn := ujconfig.NewInitializerFn(func(_ client.Client) managed.Initializer {
-		return correlationlog.NewInitializer()
-	})
-	for name, r := range pc.Resources {
-		r.InitializerFns = append([]ujconfig.NewInitializerFn{fn}, r.InitializerFns...)
-		pc.Resources[name] = r
-	}
-}
-```
+`addCorrelationInitializer` prepends the initializer to every resource. It
+passes the resource's configured API group and kind (read when the controller
+is set up) as the fallback for objects whose `TypeMeta` is empty.
 
 ### 3. Edit `config/provider.go`
 
@@ -287,15 +115,17 @@ code generator — which calls `GetProvider(ctx, true)` and
 
 ### 4. Edit `cmd/provider/main.go`
 
-Wrap the top-level logger immediately after it is constructed:
+Build the logger with `newZapLogger` (`cmd/provider/logger.go`), set it for
+malformed-annotation reports, and wrap it:
 
 ```diff
-+	"github.com/crossplane-contrib/provider-openstack/internal/correlationlog"
++	logFormat = app.Flag("log-format", "Log output format: json or console.").Default("json").Enum("json", "console")
  	...
-
--	logr := logging.NewLogrLogger(zl.WithName("provider-openstack"))
-+	baseLogger := logging.NewLogrLogger(zl.WithName("provider-openstack"))
-+	logr := correlationlog.NewCorrelatingLogger(baseLogger)
+-	zl := zap.New(zap.UseDevMode(*debug))
++	zl := newZapLogger(*debug, *logFormat, os.Stderr)
+ 	baseLogger := logging.NewLogrLogger(zl.WithName("provider-openstack"))
++	correlationlog.SetLogger(baseLogger)
+ 	logr := correlationlog.NewCorrelatingLogger(baseLogger)
 ```
 
 Because both `optionsCluster.Options.Logger` and `optionsNamespaced.Options.Logger`

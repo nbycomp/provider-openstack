@@ -71,10 +71,15 @@ func managedResource(gvk schema.GroupVersionKind, ns, name, annotation string) *
 	mg.SetGroupVersionKind(gvk)
 	mg.SetNamespace(ns)
 	mg.SetName(name)
+	mg.SetUID(uidOf(gvk, ns, name))
 	if annotation != "" {
 		mg.SetAnnotations(map[string]string{CorrelationAnnotationKey: annotation})
 	}
 	return mg
+}
+
+func uidOf(gvk schema.GroupVersionKind, ns, name string) types.UID {
+	return types.UID(gvk.Kind + "/" + ns + "/" + name)
 }
 
 func reconcileLogger(base logging.Logger, gvk schema.GroupVersionKind, ns, name string) logging.Logger {
@@ -139,13 +144,45 @@ func TestAsyncTrackerLinesCarryTheResourcesFields(t *testing.T) {
 	initialize(t, managedResource(portGVK, orgA, "port-a", `{"owner_org_id":"org-a"}`))
 
 	tracker := NewCorrelatingLogger(rec).WithValues(
-		"trackerUID", "9516afb4", "resourceName", "port-a", "resourceNamespace", orgA, "gvk", portGVK.String())
+		"trackerUID", uidOf(portGVK, orgA, "port-a"), "resourceName", "port-a", "resourceNamespace", orgA, "gvk", portGVK.String())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		tracker.Info("Async update callback failed", "error", "conflict")
 	}()
 	<-done
+
+	if got := rec.last(t)["owner_org_id"]; got != orgA {
+		t.Fatalf("owner_org_id = %v, want org-a", got)
+	}
+}
+
+// The typed client's decoder clears TypeMeta after an API write (the reference
+// resolver's patch, say), so upjet can bind an empty gvk to the resource.
+func TestTrackerBoundToAnEmptyGVKFindsTheResourceByUID(t *testing.T) {
+	t.Cleanup(resetStore)
+	rec := newRecorder()
+
+	initialize(t, managedResource(portGVK, orgA, "port-a", `{"owner_org_id":"org-a"}`))
+
+	NewCorrelatingLogger(rec).WithValues(
+		"trackerUID", uidOf(portGVK, orgA, "port-a"), "resourceName", "port-a", "resourceNamespace", orgA,
+		"gvk", schema.GroupVersionKind{}.String()).Info("Async create callback failed")
+
+	if got := rec.last(t)["owner_org_id"]; got != orgA {
+		t.Fatalf("owner_org_id = %v, want org-a", got)
+	}
+}
+
+func TestEventHandlerRequeueLinesCarryTheResourcesFields(t *testing.T) {
+	t.Cleanup(resetStore)
+	rec := newRecorder()
+
+	initialize(t, managedResource(portGVK, orgA, "port-a", `{"owner_org_id":"org-a"}`))
+
+	NewCorrelatingLogger(rec).WithValues("gvk", portGVK).
+		WithValues("name", types.NamespacedName{Namespace: orgA, Name: "port-a"}).
+		Info("Failure limit has been exceeded.")
 
 	if got := rec.last(t)["owner_org_id"]; got != orgA {
 		t.Fatalf("owner_org_id = %v, want org-a", got)
@@ -160,9 +197,13 @@ func TestMalformedAnnotationDoesNotFailTheReconcileAndClearsOldFields(t *testing
 	initialize(t, managedResource(portGVK, orgA, "port-a", `{not json`))
 
 	reconcileLogger(rec, portGVK, orgA, "port-a").Debug("observed")
-
 	if v, ok := rec.last(t)["owner_org_id"]; ok {
 		t.Fatalf("stale owner_org_id=%v kept after a malformed annotation", v)
+	}
+
+	reconcileLogger(rec, portGVK, orgA, "port-a").WithValues("uid", uidOf(portGVK, orgA, "port-a")).Debug("observed")
+	if v, ok := rec.last(t)["owner_org_id"]; ok {
+		t.Fatalf("stale owner_org_id=%v kept under the UID after a malformed annotation", v)
 	}
 }
 
@@ -185,11 +226,11 @@ func TestAnnotationKeysThatCollideWithFrameworkKeysAreRemapped(t *testing.T) {
 	t.Cleanup(resetStore)
 	rec := newRecorder()
 
-	initialize(t, managedResource(portGVK, orgA, "port-a", `{"gvk":"x","request":"y","name":"z"}`))
+	initialize(t, managedResource(portGVK, orgA, "port-a", `{"gvk":"x","request":"y","name":"z","ts":"t","msg":"m"}`))
 	reconcileLogger(rec, portGVK, orgA, "port-a").Debug("observed")
 
 	got := rec.last(t)
-	for _, k := range []string{"correlation_id_gvk", "correlation_id_request", "correlation_id_name"} {
+	for _, k := range []string{"correlation_id_gvk", "correlation_id_request", "correlation_id_name", "correlation_id_ts", "correlation_id_msg"} {
 		if _, ok := got[k]; !ok {
 			t.Errorf("missing remapped key %s in %v", k, got)
 		}

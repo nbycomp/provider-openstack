@@ -31,11 +31,13 @@ func TestJSONFormatWithoutDebugDropsDebugLines(t *testing.T) {
 }
 
 func TestConsoleFormatIsNotJSON(t *testing.T) {
-	var buf bytes.Buffer
-	newZapLogger(true, "console", &buf).Info("observed")
+	for _, debug := range []bool{true, false} {
+		var buf bytes.Buffer
+		newZapLogger(debug, "console", &buf).Info("observed")
 
-	if strings.HasPrefix(strings.TrimSpace(buf.String()), "{") {
-		t.Fatalf("console format produced JSON: %q", buf.String())
+		if strings.HasPrefix(strings.TrimSpace(buf.String()), "{") {
+			t.Fatalf("console format with debug=%t produced JSON: %q", debug, buf.String())
+		}
 	}
 }
 

@@ -17,9 +17,10 @@ The value must be a flat JSON object. Keys that would clash with fields the
 reconciler, upjet or controller-runtime already log (`controller`,
 `controllerKind`, `name`, `namespace`, `reconcileID`, `request`, `uid`, `gvk`,
 `trackerUID`, `resourceName`, `resourceNamespace`, `error`, `external-name`,
-`version`) are prefixed with `correlation_id_`. A malformed annotation is
-ignored and reported once per reconcile with `faultDomain: input`; it never
-fails the reconcile.
+`version`), or with the JSON encoder's own keys (`ts`, `level`, `msg`,
+`logger`, `caller`, `stacktrace`), are prefixed with `correlation_id_`. A
+malformed annotation is ignored and reported once per reconcile with
+`faultDomain: input`; it never fails the reconcile.
 
 ## How it works
 
@@ -28,20 +29,27 @@ Two cooperating components are wired together:
 1. **`correlationInitializer`**: a `managed.Initializer` registered as the
    first initializer on every controller. On each reconcile it parses the
    annotation and stores the fields in a package-level map keyed by the managed
-   resource (API group, kind, namespace, name). A resource with no annotation,
-   or a malformed one, has its entry removed.
+   resource, once under its UID and once under its API group, kind, namespace
+   and name. A resource with no annotation, or a malformed one, has its entries
+   removed.
 
 2. **`CorrelatingLogger`**: a `logging.Logger` wrapper set as the provider's
    top-level logger. The managed reconciler and upjet already attach the
    resource's identity through `WithValues`:
-   - the reconciler adds `controller` and `request`
-   - the external client adds `name`, `namespace` and `gvk`
-   - the async operation tracker adds `resourceName`, `resourceNamespace` and `gvk`
+   - the reconciler adds `controller` and `request`, then `uid`
+   - the external client adds `uid`, `name`, `namespace` and `gvk`
+   - the async operation tracker adds `trackerUID`, `resourceName`, `resourceNamespace` and `gvk`
+   - the event handler adds `gvk`, then `name`
+
+   A bound UID takes precedence: the external client and the tracker take `gvk`
+   from the object's `TypeMeta`, which is empty after an API write such as the
+   reference resolver's patch.
 
    The wrapper binds to that identity and adds the stored fields of that
    resource, and only that resource, to every `Info` and `Debug` line.
-   Values passed at call time only fill identity parts that are still unknown,
-   so a line that mentions another object's `name` keeps its own resource.
+   Values passed at call time are only used while the bound values do not yet
+   name a resource, so a line that mentions another object's `name` keeps its
+   own resource.
 
 Because the store is keyed by resource rather than by goroutine, a line never
 carries another resource's fields. Lines logged outside the reconcile
@@ -65,8 +73,8 @@ shipped as JSON.
 |---|---|---|
 | Reconcile, external client and async callback lines | ✅ | Bound to the resource through the identity keys above |
 | Lines logged before the first `Initialize` of a resource | ⚠️ | Nothing is stored yet; they carry no correlation fields, never another resource's |
-| Orphan-deletion path (`DeletionPolicy: Orphan`) | ⚠️ | Skips `Initialize`; uses the fields stored by an earlier reconcile, if any |
-| Event-handler callbacks without the resource's name | ⚠️ | No identity to bind to |
+| Orphan-deletion path (`DeletionPolicy: Orphan`) and paused resources | ⚠️ | Skip `Initialize`; use the fields stored by an earlier reconcile, if any |
+| Event-handler lines that carry only the kind | ⚠️ | No identity to bind to |
 
 Entries for deleted resources stay in the map; each holds only the resource's
 correlation fields.

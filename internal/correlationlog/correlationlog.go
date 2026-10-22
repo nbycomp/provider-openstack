@@ -25,8 +25,8 @@ const (
 )
 
 // reservedLogFieldKeys are keys the reconciler, upjet and controller-runtime
-// already emit. Annotation keys with these names are remapped so they never
-// shadow or duplicate them.
+// already emit, plus the JSON encoder's own top-level keys. Annotation keys with
+// these names are remapped so they never shadow or duplicate them.
 var reservedLogFieldKeys = map[string]struct{}{
 	"controller":        {},
 	"controllerKind":    {},
@@ -42,12 +42,18 @@ var reservedLogFieldKeys = map[string]struct{}{
 	"error":             {},
 	"external-name":     {},
 	"version":           {},
+	"ts":                {},
+	"level":             {},
+	"msg":               {},
+	"logger":            {},
+	"caller":            {},
+	"stacktrace":        {},
 }
 
 // store maps a managed resource (identity.key) to the key/value pairs parsed
-// from its annotation. It is keyed by resource rather than by goroutine so that
-// a line can never carry another resource's fields, and so that lines logged
-// outside the reconcile goroutine (async upjet callbacks) are enriched too.
+// from its annotation. Keying by resource means a line never carries another
+// resource's fields, and lines logged outside the reconcile goroutine (async
+// upjet callbacks) are enriched too.
 var store sync.Map
 
 var warnLogger logging.Logger = logging.NewNopLogger()
@@ -60,16 +66,23 @@ func SetLogger(l logging.Logger) {
 // identity is the managed resource a logger is bound to, learnt from the keys
 // the managed reconciler and upjet already attach with WithValues.
 type identity struct {
+	uid       string
 	groupKind string
 	namespace string
 	name      string
 }
 
-func (id identity) key() (string, bool) {
-	if id.groupKind == "" || id.name == "" {
-		return "", false
+// key returns the store key for id, or "" while id names no resource. The UID
+// wins because upjet takes the gvk it binds from the object's TypeMeta, which
+// the typed client clears after an API write.
+func (id identity) key() string {
+	if id.uid != "" {
+		return "uid|" + id.uid
 	}
-	return id.groupKind + "|" + id.namespace + "|" + id.name, true
+	if id.groupKind == "" || id.name == "" {
+		return ""
+	}
+	return id.groupKind + "|" + id.namespace + "|" + id.name
 }
 
 // with returns id updated from kvs. With fillOnly, only fields that are still
@@ -90,6 +103,7 @@ func (id identity) merge(f identity, fillOnly bool) identity {
 			*field = v
 		}
 	}
+	set(&id.uid, f.uid)
 	set(&id.groupKind, f.groupKind)
 	set(&id.namespace, f.namespace)
 	set(&id.name, f.name)
@@ -101,13 +115,13 @@ func (id identity) merge(f identity, fillOnly bool) identity {
 func identityFields(k string, v any) identity {
 	switch v := v.(type) {
 	case reconcile.Request:
-		if k == "request" {
-			return identity{namespace: v.Namespace, name: v.Name}
-		}
+		return identityFields(k, v.NamespacedName)
 	case types.NamespacedName:
-		if k == "request" {
+		if k == "request" || k == "name" {
 			return identity{namespace: v.Namespace, name: v.Name}
 		}
+	case types.UID:
+		return identityFromString(k, string(v))
 	case schema.GroupVersionKind:
 		if k == "gvk" {
 			return identity{groupKind: groupKindKey(v.GroupKind())}
@@ -127,6 +141,8 @@ func identityFromString(k, v string) identity {
 		}
 	case "gvk":
 		return identity{groupKind: groupKindFromGVKString(v)}
+	case "uid", "trackerUID":
+		return identity{uid: v}
 	case "name", "resourceName":
 		return identity{name: v}
 	case "namespace", "resourceNamespace":
@@ -166,6 +182,7 @@ func NewCorrelatingLogger(base logging.Logger) *CorrelatingLogger {
 type CorrelatingLogger struct {
 	base logging.Logger
 	id   identity
+	key  string // id.key(), computed once rather than on every line
 }
 
 // Info implements logging.Logger.
@@ -180,12 +197,16 @@ func (l *CorrelatingLogger) Debug(msg string, kvs ...any) {
 
 // WithValues implements logging.Logger.
 func (l *CorrelatingLogger) WithValues(kvs ...any) logging.Logger {
-	return &CorrelatingLogger{base: l.base.WithValues(kvs...), id: l.id.with(kvs, false)}
+	id := l.id.with(kvs, false)
+	return &CorrelatingLogger{base: l.base.WithValues(kvs...), id: id, key: id.key()}
 }
 
 func (l *CorrelatingLogger) enrich(kvs []any) []any {
-	key, ok := l.id.with(kvs, true).key()
-	if !ok {
+	key := l.key
+	if key == "" {
+		key = l.id.with(kvs, true).key()
+	}
+	if key == "" {
 		return kvs
 	}
 	v, ok := store.Load(key)
@@ -216,31 +237,33 @@ func (c correlationInitializer) Initialize(_ context.Context, mg xpresource.Mana
 	if gk.Kind == "" {
 		gk = c.fallback
 	}
-	key, ok := identity{groupKind: groupKindKey(gk), namespace: mg.GetNamespace(), name: mg.GetName()}.key()
-	if !ok {
-		return nil
-	}
 	values, err := extractCorrelationValues(mg.GetAnnotations())
 	if err != nil {
-		store.Delete(key)
 		warnLogger.Info("ignoring malformed correlation annotation",
 			"faultDomain", "input",
 			"annotation", CorrelationAnnotationKey,
+			"kind", gk.String(),
 			"name", mg.GetName(),
 			"namespace", mg.GetNamespace(),
 			"error", err.Error())
-		return nil
 	}
-	if len(values) == 0 {
-		store.Delete(key)
-		return nil
-	}
-	keys := sortedKeys(values)
-	kvs := make([]any, 0, len(keys)*2)
-	for _, k := range keys {
+	kvs := make([]any, 0, len(values)*2)
+	for _, k := range sortedKeys(values) {
 		kvs = append(kvs, logFieldKey(k), values[k])
 	}
-	store.Store(key, kvs)
+	for _, key := range []string{
+		identity{uid: string(mg.GetUID())}.key(),
+		identity{groupKind: groupKindKey(gk), namespace: mg.GetNamespace(), name: mg.GetName()}.key(),
+	} {
+		if key == "" {
+			continue
+		}
+		if len(kvs) == 0 {
+			store.Delete(key)
+			continue
+		}
+		store.Store(key, kvs)
+	}
 	return nil
 }
 

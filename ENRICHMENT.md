@@ -72,9 +72,9 @@ shipped as JSON.
 | Lines | Enriched? | Reason |
 |---|---|---|
 | Reconcile, external client and async callback lines | ✅ | Bound to the resource through the identity keys above |
-| Lines logged before the first `Initialize` of a resource | ⚠️ | Nothing is stored yet; they carry no correlation fields, never another resource's |
+| Lines logged before the first `Initialize` of a resource | ⚠️ | Nothing is stored yet; they carry no correlation fields |
 | Orphan-deletion path (`DeletionPolicy: Orphan`) and paused resources | ⚠️ | Skip `Initialize`; use the fields stored by an earlier reconcile, if any |
-| Event-handler lines that carry only the kind | ⚠️ | No identity to bind to |
+| Lines logged before the reconciler binds `uid`, for a resource recreated under the same name | ⚠️ | Looked up by kind and name, so they may carry the deleted object's fields |
 
 Entries for deleted resources stay in the map; each holds only the resource's
 correlation fields.

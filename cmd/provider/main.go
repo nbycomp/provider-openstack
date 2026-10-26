@@ -65,6 +65,7 @@ func main() {
 			}
 		}
 		debug                   = app.Flag("debug", "Run with debug logging.").Short('d').Bool()
+		logFormat               = app.Flag("log-format", "Log output format: json or console.").Default("json").Enum("json", "console")
 		syncPeriod              = app.Flag("sync", "Controller manager sync period such as 300ms, 1.5h, or 2h45m").Short('s').Default("1h").Duration()
 		pollInterval            = app.Flag("poll", "Poll interval controls how often an individual resource should be checked for drift.").Default("10m").Duration()
 		pollStateMetricInterval = app.Flag("poll-state-metric", "State metric recording interval").Default("5s").Duration()
@@ -96,8 +97,9 @@ func main() {
 	log.Default().SetOutput(io.Discard)
 	ctrl.SetLogger(zap.New(zap.WriteTo(io.Discard)))
 
-	zl := zap.New(zap.UseDevMode(*debug))
+	zl := newZapLogger(*debug, *logFormat, os.Stderr)
 	baseLogger := logging.NewLogrLogger(zl.WithName("provider-openstack"))
+	correlationlog.SetLogger(baseLogger)
 	logr := correlationlog.NewCorrelatingLogger(baseLogger)
 	if *debug {
 		// The controller-runtime runs with a no-op logger by default. It is

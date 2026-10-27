@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/alecthomas/kingpin/v2"
 )
 
 func TestJSONFormatWithDebugKeepsDebugLinesAsJSON(t *testing.T) {
@@ -57,5 +59,43 @@ func TestJSONTimestampIsAnRFC3339String(t *testing.T) {
 	}
 	if _, err := time.Parse(time.RFC3339, ts); err != nil {
 		t.Fatalf("ts %q is not RFC3339: %v", ts, err)
+	}
+}
+
+// The operators writing to the same index log durations as strings ("30s");
+// zap's default float seconds would give one key two JSON types.
+func TestJSONDurationIsAString(t *testing.T) {
+	var buf bytes.Buffer
+	newZapLogger(false, "json", &buf).Info("observed", "requeueAfter", 30*time.Second)
+
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+		t.Fatalf("line is not JSON: %q", buf.String())
+	}
+	if line["requeueAfter"] != "30s" {
+		t.Fatalf("requeueAfter = %#v, want \"30s\"", line["requeueAfter"])
+	}
+}
+
+func TestLogFormatFlagReadsLogFormatEnv(t *testing.T) {
+	t.Setenv("LOG_FORMAT", "console")
+	app := kingpin.New("provider", "").DefaultEnvars()
+	format := logFormatFlag(app)
+	if _, err := app.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if *format != "console" {
+		t.Fatalf("log format = %q, want console from LOG_FORMAT", *format)
+	}
+}
+
+func TestLogFormatFlagDefaultsToJSON(t *testing.T) {
+	app := kingpin.New("provider", "").DefaultEnvars()
+	format := logFormatFlag(app)
+	if _, err := app.Parse(nil); err != nil {
+		t.Fatal(err)
+	}
+	if *format != "json" {
+		t.Fatalf("log format = %q, want json", *format)
 	}
 }

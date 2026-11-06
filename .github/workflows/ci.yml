@@ -48,6 +48,13 @@ jobs:
         run: |
           make crddiff
 
+      # schema-version-diff reads the base branch as a local ref, which
+      # changed-files no longer creates.
+      - name: Fetch the base branch
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "+refs/heads/${GITHUB_BASE_REF}:refs/heads/${GITHUB_BASE_REF}"
+
       - name: Report native schema version changes
         run: |
           make schema-version-diff
